@@ -52,6 +52,15 @@ THINKING = "max"
 # arrives
 STOP_BEFORE_SEC = 90
 CATALOG_TIMEOUT_SEC = 30
+# Pi settings: keep long reasoning calls alive, refresh Claude's prompt cache,
+# and retry transient model failures with a useful backoff window.
+SETTINGS = {
+    "defaultProjectTrust": "never",
+    "quietStartup": True,
+    "cacheWarming": "streaming",
+    "retry": {"maxRetries": 8, "baseDelayMs": 2000, "maxAgentDelayMs": 60000},
+    "httpIdleTimeoutMs": 3_600_000,
+}
 # Request features the Google Cloud route for Claude refuses. pi leaves them
 # out, and the Anthropic API works without them too.
 COMPAT = {
@@ -65,11 +74,34 @@ UNKNOWN_MODEL = {"input": ["text"], "contextWindow": 128000, "maxTokens": 16384}
 NOTE = (
     "You are working on an engineering task. Your tools act on the task's Linux"
     " container, whose working directory is {workdir}; it has no internet"
-    " access. Read the whole instruction and the files it points to, put every"
-    " deliverable exactly where and in the format the instruction asks, and"
-    " check what you wrote. When you are done, reply with a short summary of"
-    " what you delivered and where."
+    " access. Read the entire task instruction and inspect every starting file"
+    " it names before acting. Build a short checklist of the required"
+    " deliverables, exact paths, formats, and acceptance checks. Start the"
+    " first required deliverable early, then refine it. Use code and the"
+    " available task tools for calculations, geometry, and file validation;"
+    " do not rely on an unverified claim in your final answer. Preserve"
+    " templates and required filenames. Before replying, re-read the task,"
+    " verify every required path exists, reopen important outputs, and correct"
+    " any mismatch you find. If an assumption is unavoidable, make the best"
+    " defensible artifact at the requested path and state the assumption."
+    " Never finish with no deliverable when a required path can be created."
+    " When done, reply with a short summary of what you delivered and where."
 )
+
+TIME_NOTE = (
+    " You have about {minutes} minutes in all; leave time to finish the"
+    " deliverables and send the final summary."
+)
+
+
+def note(session: taskbridge.Session) -> str:
+  """Returns the system note with the current task time budget."""
+  left = session.time_left()
+  text = NOTE.format(workdir=session.workdir)
+  if left is None:
+    return text
+  return text + TIME_NOTE.format(minutes=int(left // 60))
+
 
 
 def provider() -> tuple[str, dict[str, Any]]:
@@ -151,13 +183,7 @@ def configure(
   if not in_catalog(name, model, env):
     config["models"] = [{"id": model, "name": model, **UNKNOWN_MODEL}]
     models.write_text(json.dumps({"providers": {name: config}}))
-  settings = {
-      "defaultProjectTrust": "never",
-      "quietStartup": True,
-      "cacheWarming": "off",
-      "retry": {"maxRetries": 6, "maxAgentDelayMs": 60000},
-  }
-  (agent_dir / "settings.json").write_text(json.dumps(settings))
+  (agent_dir / "settings.json").write_text(json.dumps(SETTINGS))
   servers = {
       s["name"]: {"url": relay.mcp_url(s["name"]), "timeout": 300}
       for s in session.mcp_servers
@@ -282,7 +308,7 @@ async def solve(session: taskbridge.Session) -> str:
           "--thinking",
           THINKING,
           "--append-system-prompt",
-          NOTE.format(workdir=session.workdir),
+          note(session),
       ]
       run = Run(session, model)
       done = await taskbridge.run_process(
